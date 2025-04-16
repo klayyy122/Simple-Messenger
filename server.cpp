@@ -1,184 +1,293 @@
-﻿#include <winsock2.h>
-#include <iostream>
-#include <thread>
-#include <mutex>
-#include <memory>
-#include <set>
-#pragma warning(default: 4996)
-#pragma comment(lib, "ws2_32.lib")
-#define MAX_CONNECTIONS 2
-using namespace std;
 
-SOCKET Connections[MAX_CONNECTIONS];                 // Массив для хранения подключений
-int Counter = 0;                                      // Индекс подключений
-mutex ConnectionMutex;                                // Мьютекс для защиты общих ресурсов
-set<string> Logins;                                   // Множество для хранения уникальных логинов
+#include"server.hpp"
 
-enum Packet {
-    P_ChatMessageAll,                                 // Для широковещательных сообщений
-    P_LoginTaken,                                     // Для уведомления о занятом логине
-    P_ServerMessage                                   // Для серверных уведомлений
-};
+std::string ADMIN_PASSWORD = "admin123";
 
-bool ProcessPacket(int index, Packet packettype) {
-    switch (packettype) {
-    case P_ChatMessageAll:
+    void Server::safe_print(const string &message)
     {
-        int msg_size;                                  // Переменная для записи размера строки
-        if (recv(Connections[index], (char*)&msg_size, sizeof(int), NULL) <= 0) {
-            cout << "Error receiving message size from client " << index << endl;
-            return false;
+        lock_guard<mutex> guard(cout_mutex);
+        cout << "[SERVER] " << message << endl;
+    }
+
+    void Server::send_to_client(SOCKET socket, const string &message)
+    {
+        send(socket, message.c_str(), (int)message.size(), 0);
+    }
+
+    void Server::broadcast_message(const string &sender, const string &message)
+    {
+        lock_guard<mutex> guard(clients_mutex);
+        for (auto &pair : clients)
+        {
+            if (pair.first != sender)
+            {
+                send_to_client(pair.second.socket, message);
+            }
+        }
+    }
+
+    void Server::disconnect_client(const string &client_name)
+    {
+        lock_guard<mutex> guard(clients_mutex);
+        if (clients.count(client_name))
+        {
+            closesocket(clients[client_name].socket);
+            clients.erase(client_name);
+            safe_print(client_name + " was disconnected by admin");
+
+            if (active_admins.count(client_name))
+            {
+                delete active_admins[client_name];
+                active_admins.erase(client_name);
+            }
+        }
+    }
+
+    void Server::handle_client(SOCKET client_socket)
+    {
+        char buffer[BUFFER_SIZE];
+        bool is_admin = false;
+        string client_name;
+
+        try
+        {
+            // Выбор режима подключения
+            string mode_prompt = "Choose mode:\n1. Regular client\n2. Admin\nEnter choice: ";
+            send_to_client(client_socket, mode_prompt);
+
+            int bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+            if (bytes_received <= 0)
+                throw runtime_error("Mode selection failed");
+            string choice(buffer, bytes_received);
+
+            // Режим администратора
+            if (choice == "2")
+            {
+                string auth_prompt = "Enter admin password: ";
+                send_to_client(client_socket, auth_prompt);
+
+                bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+                if (bytes_received <= 0)
+                    throw runtime_error("Password receive failed");
+
+                string password(buffer, bytes_received);
+                if (!Admin::Authenticate(password))
+                {
+                    send_to_client(client_socket, "SERVER: Invalid admin password");
+                    throw runtime_error("Invalid admin password");
+                }
+                is_admin = true;
+                send_to_client(client_socket, "SERVER: Admin authentication successful");
+            }
+
+            // Получение имени
+            string name_prompt = "Enter your name: ";
+            send_to_client(client_socket, name_prompt);
+
+            bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+            if (bytes_received <= 0)
+                throw runtime_error("Name receive failed");
+            client_name = string(buffer, bytes_received);
+
+            // Регистрация клиента
+            {
+                lock_guard<mutex> guard(clients_mutex);
+                if (clients.count(client_name))
+                {
+                    send_to_client(client_socket, "SERVER: Name already in use");
+                    throw runtime_error("Name already in use");
+                }
+
+                if (is_admin)
+                {
+                    active_admins[client_name] = new Admin(client_socket, client_name);
+                    clients[client_name] = *active_admins[client_name];
+                }
+                else
+                {
+                    clients[client_name] = Client(client_socket, client_name);
+                }
+            }
+
+            safe_print(client_name + (is_admin ? " (admin)" : "") + " connected");
+            send_to_client(client_socket, "SERVER: Welcome, " + client_name + (is_admin ? " (admin)" : ""));
+
+            // Основной цикл обработки сообщений
+            while (true)
+            {
+                bytes_received = recv(client_socket, buffer, BUFFER_SIZE, 0);
+                if (bytes_received <= 0)
+                    break;
+
+                string msg_str(buffer, bytes_received);
+                size_t delim_pos = msg_str.find(':');
+                if (delim_pos == string::npos)
+                {
+                    send_to_client(client_socket, "SERVER: Invalid message format");
+                    continue;
+                }
+
+                MessageType type = static_cast<MessageType>(stoi(msg_str.substr(0, delim_pos)));
+                string content = msg_str.substr(delim_pos + 1);
+                cout << content << " Was sent by " << client_name << endl;
+                if (type == BROADCAST)
+                {
+                    string full_msg = client_name + ": " + content;
+                    safe_print(client_name + " sent broadcast message");
+                    broadcast_message(client_name, full_msg);
+                }
+                else if (type == PRIVATE)
+                {
+                    size_t first_colon = content.find(':');
+                    if (first_colon == string::npos)
+                    {
+                        send_to_client(client_socket, "SERVER: Invalid private message format");
+                        continue;
+                    }
+
+                    string recipient = content.substr(0, first_colon);
+                    string private_msg = content.substr(first_colon + 1);
+
+                    lock_guard<mutex> guard(clients_mutex);
+                    if (clients.count(recipient))
+                    {
+                        string full_msg = "[Private from " + client_name + "]: " + private_msg;
+                        send_to_client(clients[recipient].socket, full_msg);
+                        send_to_client(client_socket, "SERVER: Private message sent to " + recipient);
+                    }
+                    else
+                    {
+                        send_to_client(client_socket, "SERVER: User " + recipient + " not found");
+                    }
+                }
+                else if (type == ADMIN_COMMAND && is_admin)
+                {
+                    if (content.substr(0, 11) == "/disconnect")
+                    {
+                        string target = content.substr(12);
+                        if (target.empty())
+                        {
+                            send_to_client(client_socket, "SERVER: Usage: /disconnect <username>");
+                            continue;
+                        }
+
+                        if (target == client_name)
+                        {
+                            send_to_client(client_socket, "SERVER: You cannot disconnect yourself");
+                            continue;
+                        }
+
+                        disconnect_client(target);
+                        send_to_client(client_socket, "SERVER: User " + target + " has been disconnected");
+                    }
+                    else
+                    {
+                        send_to_client(client_socket, "SERVER: Unknown admin command");
+                    }
+                }
+                else if (type == COMMAND)
+                {
+
+                    string client = "\n";
+                    int c = 1;
+                    for (auto it : clients)
+                    {
+                        client += to_string(c) + ". " + (it.first) + '\n';
+                        ++c;
+                    }
+                    client.pop_back();
+
+                    send_to_client(client_socket, client);
+                }
+
+                else
+                {
+                    send_to_client(client_socket, "SERVER: Unknown command type");
+                }
+            }
+        }
+        catch (const exception &e)
+        {
+            safe_print("Error with client " + client_name + ": " + e.what());
         }
 
-        unique_ptr<char[]> msg(new char[msg_size + 1]);
-        if (recv(Connections[index], msg.get(), msg_size, NULL) <= 0) {
-            cout << "Error receiving message from client " << index << endl;
-            return false;
+        // Завершение соединения
+        {
+            lock_guard<mutex> guard(clients_mutex);
+            if (!client_name.empty())
+            {
+                clients.erase(client_name);
+                if (is_admin && active_admins.count(client_name))
+                {
+                    delete active_admins[client_name];
+                    active_admins.erase(client_name);
+                }
+            }
         }
-        msg[msg_size] = '\0';
-        cout << "Received message from client " << index << ": " << msg.get() << endl;
+        closesocket(client_socket);
+        safe_print((client_name.empty() ? "Unknown client" : client_name) + " disconnected");
+    }
 
-        for (int i = 0; i < Counter; i++) {
-            if (i == index) {
+
+    void Server::run_server()
+    {
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+        {
+            safe_print("WSAStartup failed");
+            return;
+        }
+
+        SOCKET server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (server_socket == INVALID_SOCKET)
+        {
+            safe_print("Socket creation failed");
+            WSACleanup();
+            return;
+        }
+
+        sockaddr_in server_addr;
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_port = htons(DEFAULT_PORT);
+
+        if (bind(server_socket, (sockaddr *)&server_addr, sizeof(server_addr)) == SOCKET_ERROR)
+        {
+            safe_print("Bind failed");
+            closesocket(server_socket);
+            WSACleanup();
+            return;
+        }
+
+        if (listen(server_socket, SOMAXCONN) == SOCKET_ERROR)
+        {
+            safe_print("Listen failed");
+            closesocket(server_socket);
+            WSACleanup();
+            return;
+        }
+
+        safe_print("Server started on port " + to_string(DEFAULT_PORT));
+        safe_print("Waiting for connections...");
+
+        while (true)
+        {
+            sockaddr_in client_addr;
+            int client_addr_size = sizeof(client_addr);
+
+            SOCKET client_socket = accept(server_socket, (sockaddr *)&client_addr, &client_addr_size);
+            if (client_socket == INVALID_SOCKET)
+            {
+                safe_print("Accept failed");
                 continue;
             }
 
-            Packet msgtype = P_ChatMessageAll;
-            if (send(Connections[i], (char*)&msgtype, sizeof(Packet), NULL) <= 0 ||
-                send(Connections[i], (char*)&msg_size, sizeof(int), NULL) <= 0 ||
-                send(Connections[i], msg.get(), msg_size, NULL) <= 0) {
-                cout << "Error sending message to client " << i << endl;
-                return false;
-            }
-        }
-        break;
-    }
-    default:
-        cout << "Unrecognized packet: " << packettype << endl;
-        break;
-    }
-
-    return true;
-}
-
-void ClientHandler(int index) {
-    Packet packettype;
-    while (true) {
-        if (recv(Connections[index], (char*)&packettype, sizeof(Packet), NULL) <= 0) {
-            cout << "Error receiving packet from client " << index << endl;
-            break;
+            thread([this, client_socket]() {
+                this->handle_client(client_socket);
+            }).detach();
         }
 
-        if (!ProcessPacket(index, packettype)) {
-            break;
-        }
-    }
-
-    ConnectionMutex.lock();                           // Блокировка мьютекса перед изменением общего ресурса
-    closesocket(Connections[index]);
-    Connections[index] = INVALID_SOCKET;
-    ConnectionMutex.unlock();                         // Разблокировка мьютекса
-}
-
-int main(int argc, char* argv[]) {
-    WSAData wsaData;                                   // Создание структуры
-    WORD DLLVersion = MAKEWORD(2, 1);                  // Запрос версии библиотеки
-    if (WSAStartup(DLLVersion, &wsaData) != 0) {
-        cout << "Error loading DLL version" << endl;
-        exit(1);
-    }
-
-    SOCKADDR_IN addr;                                  // Заполнение информации о сокете
-    ZeroMemory(&addr, sizeof(addr));
-    int sizeofaddr = sizeof(addr);
-    addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(1111);
-    addr.sin_family = AF_INET;
-
-    SOCKET sListen = socket(AF_INET, SOCK_STREAM, NULL);// Создание слушающего сокета
-    if (sListen == INVALID_SOCKET) {
-        cout << "Error creating socket" << endl;
+        closesocket(server_socket);
         WSACleanup();
-        return 1;
     }
 
-    if (bind(sListen, (SOCKADDR*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        cout << "Error binding socket" << endl;
-        closesocket(sListen);
-        WSACleanup();
-        return 1;
-    }
-
-    if (listen(sListen, SOMAXCONN) == SOCKET_ERROR) {
-        cout << "Error listening on socket" << endl;
-        closesocket(sListen);
-        WSACleanup();
-        return 1;
-    }
-
-    SOCKET newConnection;                              // Объявление нового сокета для удержания соединения
-    while (Counter < MAX_CONNECTIONS) {
-        newConnection = accept(sListen, (SOCKADDR*)&addr, &sizeofaddr);
-
-        if (newConnection == INVALID_SOCKET) {
-            cout << "Error accepting new connection" << endl;
-        }
-        else {
-            // Принимаем логин от клиента
-            int login_size;
-            if (recv(newConnection, (char*)&login_size, sizeof(int), NULL) <= 0) {
-                cout << "Error receiving login size from client" << endl;
-                closesocket(newConnection);
-                continue;
-            }
-
-            unique_ptr<char[]> login(new char[login_size + 1]);
-            if (recv(newConnection, login.get(), login_size, NULL) <= 0) {
-                cout << "Error receiving login from client" << endl;
-                closesocket(newConnection);
-                continue;
-            }
-            login[login_size] = '\0';
-
-            // Проверяем уникальность логина
-            ConnectionMutex.lock();
-            if (Logins.find(login.get()) != Logins.end()) {
-                // Логин уже занят
-                Packet msgtype = P_LoginTaken;
-                send(newConnection, (char*)&msgtype, sizeof(Packet), NULL);
-                closesocket(newConnection);
-                ConnectionMutex.unlock();
-                cout << "Client tried to connect with taken login: " << login.get() << endl;
-                continue;
-            }
-            else {
-                // Логин уникален, добавляем его в множество
-                Logins.insert(login.get());
-                ConnectionMutex.unlock();
-            }
-
-            cout << "Client Connected with login: " << login.get() << endl;
-            string msg = "###SERVER MESSAGE###: You connected to the server!";
-            int msg_size = msg.size();
-            Packet msgtype = P_ServerMessage;  // Используем новый тип для серверных сообщений
-            if (send(newConnection, (char*)&msgtype, sizeof(Packet), NULL) <= 0 ||
-                send(newConnection, (char*)&msg_size, sizeof(int), NULL) <= 0 ||
-                send(newConnection, msg.c_str(), msg_size, NULL) <= 0) {
-                cout << "Error sending welcome message to client" << endl;
-                closesocket(newConnection);
-                continue;
-            }
-
-            ConnectionMutex.lock();                    // Блокировка мьютекса перед изменением общего ресурса
-            Connections[Counter++] = newConnection;    // Запись соединения в массив
-            ConnectionMutex.unlock();                  // Разблокировка мьютекса
-
-            thread clientThread(ClientHandler, Counter - 1);
-            clientThread.detach();                     // Отсоединение потока для выполнения в фоновом режиме
-        }
-    }
-
-    closesocket(sListen);
-    WSACleanup();
-    return 0;
-}
